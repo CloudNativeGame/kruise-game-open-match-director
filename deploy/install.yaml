@@ -1,0 +1,107 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  creationTimestamp: null
+  name: kruise-game-open-match-director-role
+rules:
+  - apiGroups:
+      - game.kruise.io
+    resources:
+      - gameservers
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - game.kruise.io
+    resources:
+      - gameservers/status
+    verbs:
+      - get
+      - patch
+      - update
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kruise-game-open-match-director-sa
+  namespace: open-match-demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kruise-game-open-match-director-rolebinding
+  namespace: open-match-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kruise-game-open-match-director-role
+subjects:
+  - kind: ServiceAccount
+    name: kruise-game-open-match-director-sa
+    namespace: open-match-demo
+---
+apiVersion: apps/v1 # for versions before 1.8.0 use apps/v1beta1
+kind: Deployment
+metadata:
+  name: kruise-game-open-match-director
+  labels:
+    app: kruise-game-open-match-director
+  namespace: open-match-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kruise-game-open-match-director
+  template:
+    metadata:
+      labels:
+        app: kruise-game-open-match-director
+    spec:
+      containers:
+      - name: kruise-game-open-match-director
+        image: registry.cn-hangzhou.aliyuncs.com/ringtail/kruise-game-open-match-director:1.3
+        imagePullPolicy: Always
+        command:
+        - '/director'
+        - '--game-server-label-selector=flappy-bird'
+        - '--lease-lock-name=kruise-game-open-match-director'
+        - '--lease-lock-namespace=open-match-demo'
+        - '--match-function-endpoint=om-function.open-match-demo.svc.cluster.local'
+        - '--match-function-port=50502'
+      serviceAccountName: kruise-game-open-match-director-sa
