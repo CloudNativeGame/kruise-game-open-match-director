@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	OpenMatchLabelSelectorKey = "game.kruise.io/open-match-selector"
+	OpenMatchLabelSelectorKey = "game.kruise.io/owner-gss"
 )
 
 type Allocator struct {
@@ -34,6 +34,7 @@ type Allocator struct {
 	MatchFunctionPort     int32
 
 	GameServerLabelSelector string
+	ProfileName             string
 
 	//GameServersReSyncInterval time.Duration
 	MatchPullingInterval time.Duration
@@ -77,14 +78,17 @@ func NewAllocator(options *Options) (allocator *Allocator, err error) {
 		GameServerLister:          gameServers.Lister(),
 		GameServerClient:          kruiseGameClient,
 		GameServerLabelSelector:   options.GameServerLabelSelector,
+		ProfileName:               options.ProfileName,
+		MatchPullingInterval:      options.MatchPullingInterval,
 	}, nil
 }
 
 func (a *Allocator) Run() {
+	log.Info("Ready to run allocator service")
 	// Generate the profiles to fetch matches for.
 	defer a.BackendConn.Close()
 
-	profiles := generateProfiles(a.GameServerLabelSelector)
+	profiles := generateProfiles(a.ProfileName)
 
 	stopCh := make(chan struct{})
 	defer close(stopCh)
@@ -99,7 +103,10 @@ func (a *Allocator) Run() {
 		}
 	}
 
+	log.Info("All informer has synced")
+
 	for range time.Tick(a.MatchPullingInterval) {
+		log.Infof("Fetch Matches from store in every %v seconds", a.MatchPullingInterval)
 		// Fetch matches for each profile and make random assignments for Tickets in
 		// the matches returned.
 		var wg sync.WaitGroup
@@ -180,30 +187,27 @@ func (a *Allocator) assignMatch(match *pb.Match) error {
 		return err
 	}
 
-	GameServerPools := make([]*v1alpha1.GameServer, 0)
+	gameServerPools := make([]*v1alpha1.GameServer, 0)
 
 	for _, gs := range gameServers {
 		if gs.Status.CurrentState == v1alpha1.Ready && gs.Spec.OpsState == v1alpha1.None && gs.Status.NetworkStatus.CurrentNetworkState == v1alpha1.NetworkReady {
-			GameServerPools = append(GameServerPools, gs)
+			gameServerPools = append(gameServerPools, gs)
 		}
 	}
 
 	chosenGameServer := &v1alpha1.GameServer{}
 
-	if len(GameServerPools) > 0 {
-		chosenGameServer = GameServerPools[0]
+	log.Infof("%d game servers ready to be matched.", len(gameServerPools))
+
+	if len(gameServerPools) > 0 {
+		chosenGameServer = gameServerPools[0]
 	} else {
-		log.Warning("No enough game servers to be matched,maybe you need to scale out more game servers.")
+		return fmt.Errorf("No enough game servers(%d) to be matched,maybe you need to scale out more game servers.", len(gameServers))
 	}
 
 	// get external addresses
 	externalAddress := chosenGameServer.Status.NetworkStatus.ExternalAddresses[0]
 	conn := fmt.Sprintf("%s:%s", externalAddress.IP, externalAddress.Ports[0].Port)
-
-	if err := a.assignConnToTickets(conn, chosenGameServer, match.GetTickets()); err != nil {
-		log.Errorf("Could not assign connection %s to match %s: %v", conn, match.GetMatchId(), err)
-		return err
-	}
 
 	patchData := []byte(`
     {
@@ -216,6 +220,13 @@ func (a *Allocator) assignMatch(match *pb.Match) error {
 
 	if err != nil {
 		log.Errorf("Failed to make match because of %s", err.Error())
+		return err
+	}
+
+	log.Infof("GameServer %s has been allocated.", chosenGameServer.Name)
+
+	if err := a.assignConnToTickets(conn, chosenGameServer, match.GetTickets()); err != nil {
+		log.Errorf("Could not assign connection %s to match %s: %v", conn, match.GetMatchId(), err)
 		return err
 	}
 

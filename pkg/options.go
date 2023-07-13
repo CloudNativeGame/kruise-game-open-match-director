@@ -15,6 +15,7 @@ type Options struct {
 	GameServerLabelSelector   string
 	GameServersReSyncInterval time.Duration
 	MatchPullingInterval      time.Duration
+	ProfileName               string
 }
 
 // GetBackendConn return backend conn of open-match service
