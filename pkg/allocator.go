@@ -14,12 +14,14 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	log "k8s.io/klog/v2"
 	"open-match.dev/open-match/pkg/pb"
+	"strings"
 	"sync"
 	"time"
 )
 
 const (
 	OpenMatchLabelSelectorKey = "game.kruise.io/owner-gss"
+	GameNameProfileKey        = "game_name"
 )
 
 type Allocator struct {
@@ -35,6 +37,7 @@ type Allocator struct {
 
 	GameServerLabelSelector string
 	ProfileName             string
+	GameServerSetNames      string
 
 	//GameServersReSyncInterval time.Duration
 	MatchPullingInterval time.Duration
@@ -79,6 +82,7 @@ func NewAllocator(options *Options) (allocator *Allocator, err error) {
 		GameServerClient:          kruiseGameClient,
 		GameServerLabelSelector:   options.GameServerLabelSelector,
 		ProfileName:               options.ProfileName,
+		GameServerSetNames:        options.GameServerSetNames,
 		MatchPullingInterval:      options.MatchPullingInterval,
 	}, nil
 }
@@ -88,7 +92,7 @@ func (a *Allocator) Run() {
 	// Generate the profiles to fetch matches for.
 	defer a.BackendConn.Close()
 
-	profiles := generateProfiles(a.ProfileName)
+	profiles := a.generateProfiles()
 
 	stopCh := make(chan struct{})
 	defer close(stopCh)
@@ -168,10 +172,13 @@ func (a *Allocator) fetch(p *pb.MatchProfile) ([]*pb.Match, error) {
 
 // assignMatch assigns `match`. If we fail, abandon the tickets - we'll catch it next loop.
 func (a *Allocator) assignMatch(match *pb.Match) error {
-
+	gssName := match.MatchProfile
+	if match.MatchProfile == a.ProfileName {
+		gssName = a.GameServerSetNames
+	}
 	labelSelector := metav1.LabelSelector{
 		MatchLabels: map[string]string{
-			OpenMatchLabelSelectorKey: a.GameServerLabelSelector,
+			OpenMatchLabelSelectorKey: gssName,
 		},
 	}
 
@@ -258,12 +265,26 @@ func (a *Allocator) assignConnToTickets(conn string, gameServer *v1alpha1.GameSe
 	return err
 }
 
-func generateProfiles(profileName string) []*pb.MatchProfile {
+func (a *Allocator) generateProfiles() []*pb.MatchProfile {
 	var profiles []*pb.MatchProfile
+	for _, gssName := range strings.Split(a.GameServerSetNames, ",") {
+		profiles = append(profiles, &pb.MatchProfile{
+			Name: gssName,
+			Pools: []*pb.Pool{{
+				Name: GameNameProfileKey,
+				StringEqualsFilters: []*pb.StringEqualsFilter{
+					{
+						StringArg: GameNameProfileKey,
+						Value:     gssName,
+					},
+				},
+			}},
+		})
+	}
 	profiles = append(profiles, &pb.MatchProfile{
-		Name: profileName,
+		Name: a.ProfileName,
 		Pools: []*pb.Pool{{
-			Name: profileName,
+			Name: a.ProfileName,
 		}},
 	})
 	return profiles

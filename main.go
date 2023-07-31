@@ -57,7 +57,8 @@ func main() {
 	flag.StringVar(&opt.GameServerLabelSelector, "game-server-label-selector", "open-match-demo", "default game server labelSelector.")
 	flag.DurationVar(&opt.GameServersReSyncInterval, "game-server-resync-interval", time.Second*30, "re-sync game servers interval,default: 30x")
 	flag.DurationVar(&opt.MatchPullingInterval, "match-pulling-interval", time.Second*5, "match pulling interval,default: 5s")
-	flag.StringVar(&opt.ProfileName, "profile-name", "", "")
+	flag.StringVar(&opt.GameServerSetNames, "gss-names", "", "the names of GameServerSets perceived by director")
+	flag.StringVar(&opt.ProfileName, "profile-name", "default", "")
 	flag.Parse()
 
 	if leaseLockName == "" {
