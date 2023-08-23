@@ -3,12 +3,15 @@ package pkg
 import (
 	"context"
 	"fmt"
+	"github.com/golang/protobuf/ptypes"
+	"github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/openkruise/kruise-game/apis/v1alpha1"
 	"github.com/openkruise/kruise-game/pkg/client/clientset/versioned"
 	v1alpha1client "github.com/openkruise/kruise-game/pkg/client/clientset/versioned"
 	"github.com/openkruise/kruise-game/pkg/client/informers/externalversions"
 	v1alpha1Lister "github.com/openkruise/kruise-game/pkg/client/listers/apis/v1alpha1"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/anypb"
 	"io"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -20,6 +23,8 @@ import (
 )
 
 const (
+	BackfillConnectionKey     = "game.kruise.io/connection"
+	BackfillConnectedTag      = "game.kruise.io/connected"
 	OpenMatchLabelSelectorKey = "game.kruise.io/owner-gss"
 	GameNameProfileKey        = "game_name"
 )
@@ -29,8 +34,10 @@ type Allocator struct {
 	GameServerLister          v1alpha1Lister.GameServerLister
 	GameServerClient          v1alpha1client.Interface
 
-	BackendClient pb.BackendServiceClient
-	BackendConn   *grpc.ClientConn
+	BackendClient  pb.BackendServiceClient
+	BackendConn    *grpc.ClientConn
+	FrontendClient pb.FrontendServiceClient
+	FrontendConn   *grpc.ClientConn
 
 	MatchFunctionEndpoint string
 	MatchFunctionPort     int32
@@ -59,6 +66,20 @@ func NewAllocator(options *Options) (allocator *Allocator, err error) {
 
 	be := pb.NewBackendServiceClient(backendConn)
 
+	frontendConnStr, err := options.GetFrontendConn()
+	if err != nil {
+		log.Errorf("Failed to init frontend conn,because of %v", err)
+		return
+	}
+
+	frontendConn, err := grpc.Dial(frontendConnStr, grpc.WithInsecure())
+	if err != nil {
+		log.Errorf("Failed to connect to Open Match Frontend, got %v", err)
+		return
+	}
+
+	fe := pb.NewFrontendServiceClient(frontendConn)
+
 	config := options.Config
 	kruiseGameClient, err := versioned.NewForConfig(config)
 
@@ -74,8 +95,10 @@ func NewAllocator(options *Options) (allocator *Allocator, err error) {
 
 	return &Allocator{
 		BackendConn:               backendConn,
+		FrontendConn:              frontendConn,
 		gameServerInformerFactory: gameServerInformerFactory,
 		BackendClient:             be,
+		FrontendClient:            fe,
 		MatchFunctionEndpoint:     options.MatchFunctionEndpoint,
 		MatchFunctionPort:         int32(options.MatchFunctionPort),
 		GameServerLister:          gameServers.Lister(),
@@ -172,6 +195,73 @@ func (a *Allocator) fetch(p *pb.MatchProfile) ([]*pb.Match, error) {
 
 // assignMatch assigns `match`. If we fail, abandon the tickets - we'll catch it next loop.
 func (a *Allocator) assignMatch(match *pb.Match) error {
+	backfill, conn, err := a.getBackfillConn(match)
+	if err != nil {
+		return err
+	}
+	log.Infof("The backfill in the match %v is %v", match, backfill)
+	if conn == "" {
+		chosenGameServer, err := a.choseGameServer(match)
+		if err != nil {
+			return err
+		}
+
+		// get external addresses
+		externalAddress := chosenGameServer.Status.NetworkStatus.ExternalAddresses[0]
+		conn = fmt.Sprintf("%s:%s", externalAddress.IP, externalAddress.Ports[0].Port)
+
+		patchData := []byte(`
+		{
+			"spec": {
+				"opsState": "Allocated"
+			}
+		}`)
+
+		_, err = a.GameServerClient.GameV1alpha1().GameServers(chosenGameServer.Namespace).Patch(context.Background(), chosenGameServer.Name, types.MergePatchType, patchData, metav1.PatchOptions{})
+
+		if err != nil {
+			log.Errorf("Failed to make match because of %s", err.Error())
+			return err
+		}
+
+		log.Infof("GameServer %s has been allocated.", chosenGameServer.Name)
+
+		if backfill != nil {
+			err = a.updateBackfill(backfill, conn)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := a.assignConnToTickets(conn, match.GetTickets()); err != nil {
+		log.Errorf("Could not assign connection %s to match %s: %v", conn, match.GetMatchId(), err)
+		return err
+	}
+
+	log.Infof("Assigned %s to match %s", conn, match.GetMatchId())
+	return nil
+}
+
+func (a *Allocator) getBackfillConn(match *pb.Match) (*pb.Backfill, string, error) {
+	backfill := match.Backfill
+	if backfill != nil {
+		if backfill.Extensions != nil {
+			if any, ok := backfill.Extensions[BackfillConnectionKey]; ok {
+				var val wrappers.StringValue
+				err := ptypes.UnmarshalAny(any, &val)
+				if err != nil {
+					return nil, "", err
+				}
+				return backfill, val.Value, nil
+			}
+		}
+		return backfill, "", nil
+	}
+	return nil, "", nil
+}
+
+func (a *Allocator) choseGameServer(match *pb.Match) (*v1alpha1.GameServer, error) {
 	gssName := match.MatchProfile
 	if match.MatchProfile == a.ProfileName {
 		gssName = a.GameServerSetNames
@@ -185,13 +275,13 @@ func (a *Allocator) assignMatch(match *pb.Match) error {
 	selector, err := metav1.LabelSelectorAsSelector(&labelSelector)
 	if err != nil {
 		log.Errorf("Failed to create correct label selector,because of %s", err.Error())
-		return err
+		return nil, err
 	}
 
 	gameServers, err := a.GameServerLister.List(selector)
 	if err != nil {
 		log.Errorf("Failed to list game servers,because of %s", err.Error())
-		return err
+		return nil, err
 	}
 
 	gameServerPools := make([]*v1alpha1.GameServer, 0)
@@ -209,39 +299,37 @@ func (a *Allocator) assignMatch(match *pb.Match) error {
 	if len(gameServerPools) > 0 {
 		chosenGameServer = gameServerPools[0]
 	} else {
-		return fmt.Errorf("No enough game servers(%d) to be matched,maybe you need to scale out more game servers.", len(gameServers))
+		return nil, fmt.Errorf("No enough game servers(%d) to be matched,maybe you need to scale out more game servers.", len(gameServers))
 	}
 
-	// get external addresses
-	externalAddress := chosenGameServer.Status.NetworkStatus.ExternalAddresses[0]
-	conn := fmt.Sprintf("%s:%s", externalAddress.IP, externalAddress.Ports[0].Port)
+	return chosenGameServer, nil
+}
 
-	patchData := []byte(`
-    {
-        "spec": {
-            "opsState": "Allocated"
-        }
-    }`)
+func (a *Allocator) updateBackfill(backfill *pb.Backfill, conn string) error {
+	// update backfill connection info
+	if backfill.Extensions == nil {
+		backfill.Extensions = make(map[string]*anypb.Any)
+	}
 
-	_, err = a.GameServerClient.GameV1alpha1().GameServers(chosenGameServer.Namespace).Patch(context.Background(), chosenGameServer.Name, types.MergePatchType, patchData, metav1.PatchOptions{})
-
+	any, err := ptypes.MarshalAny(&wrappers.StringValue{Value: conn})
 	if err != nil {
-		log.Errorf("Failed to make match because of %s", err.Error())
 		return err
 	}
 
-	log.Infof("GameServer %s has been allocated.", chosenGameServer.Name)
+	backfill.Extensions[BackfillConnectionKey] = any
+	backfill.SearchFields.Tags = append(backfill.SearchFields.Tags, BackfillConnectedTag)
 
-	if err := a.assignConnToTickets(conn, chosenGameServer, match.GetTickets()); err != nil {
-		log.Errorf("Could not assign connection %s to match %s: %v", conn, match.GetMatchId(), err)
+	req := &pb.UpdateBackfillRequest{
+		Backfill: backfill,
+	}
+	_, err = a.FrontendClient.UpdateBackfill(context.Background(), req)
+	if err != nil {
 		return err
 	}
-
-	log.Infof("Assigned %s to match %s", conn, match.GetMatchId())
 	return nil
 }
 
-func (a *Allocator) assignConnToTickets(conn string, gameServer *v1alpha1.GameServer, tickets []*pb.Ticket) error {
+func (a *Allocator) assignConnToTickets(conn string, tickets []*pb.Ticket) error {
 	ticketIDs := []string{}
 	for _, t := range tickets {
 		ticketIDs = append(ticketIDs, t.Id)

@@ -52,6 +52,8 @@ func main() {
 	flag.StringVar(&leaseLockNamespace, "lease-lock-namespace", "", "the lease lock resource namespace")
 	flag.StringVar(&opt.BackendEndpoint, "backend-endpoint", "open-match-backend.open-match.svc.cluster.local", "default open-match backend endpoint.")
 	flag.IntVar(&opt.BackendPort, "backend-port", 50505, "default open-match backend port.")
+	flag.StringVar(&opt.FrontendEndpoint, "frontend-endpoint", "open-match-frontend.open-match.svc.cluster.local", "default open-match backend endpoint.")
+	flag.IntVar(&opt.FrontendPort, "frontend-port", 50504, "default open-match frontend port.")
 	flag.StringVar(&opt.MatchFunctionEndpoint, "match-function-endpoint", "open-match-matchfunction.open-match.svc.cluster.local", "default open-match matchfunction endpoint.")
 	flag.IntVar(&opt.MatchFunctionPort, "match-function-port", 50502, "default open-match front port.")
 	flag.StringVar(&opt.GameServerLabelSelector, "game-server-label-selector", "open-match-demo", "default game server labelSelector.")
