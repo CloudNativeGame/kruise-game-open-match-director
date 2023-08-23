@@ -11,6 +11,8 @@ type Options struct {
 	MatchFunctionPort         int
 	BackendEndpoint           string
 	BackendPort               int
+	FrontendEndpoint          string
+	FrontendPort              int
 	Config                    *rest.Config
 	GameServerLabelSelector   string
 	GameServersReSyncInterval time.Duration
@@ -22,4 +24,9 @@ type Options struct {
 // GetBackendConn return backend conn of open-match service
 func (o *Options) GetBackendConn() (string, error) {
 	return fmt.Sprintf("%s:%d", o.BackendEndpoint, o.BackendPort), nil
+}
+
+// GetFrontendConn return backend conn of open-match service
+func (o *Options) GetFrontendConn() (string, error) {
+	return fmt.Sprintf("%s:%d", o.FrontendEndpoint, o.FrontendPort), nil
 }
