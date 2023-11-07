@@ -234,7 +234,7 @@ func (a *Allocator) assignMatch(match *pb.Match) error {
 		}
 	}
 
-	if err := a.assignConnToTickets(conn, match.GetTickets()); err != nil {
+	if err := a.assignConnToTickets(conn, match); err != nil {
 		log.Errorf("Could not assign connection %s to match %s: %v", conn, match.GetMatchId(), err)
 		return err
 	}
@@ -329,9 +329,9 @@ func (a *Allocator) updateBackfill(backfill *pb.Backfill, conn string) error {
 	return nil
 }
 
-func (a *Allocator) assignConnToTickets(conn string, tickets []*pb.Ticket) error {
+func (a *Allocator) assignConnToTickets(conn string, match *pb.Match) error {
 	ticketIDs := []string{}
-	for _, t := range tickets {
+	for _, t := range match.GetTickets() {
 		ticketIDs = append(ticketIDs, t.Id)
 	}
 
@@ -341,6 +341,7 @@ func (a *Allocator) assignConnToTickets(conn string, tickets []*pb.Ticket) error
 				TicketIds: ticketIDs,
 				Assignment: &pb.Assignment{
 					Connection: conn,
+					Extensions: match.Extensions,
 					//Extensions: map[string]*anypb.Any{
 					//	"GameServer": gameServer,
 					//},
