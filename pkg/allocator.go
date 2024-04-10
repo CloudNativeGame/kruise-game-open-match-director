@@ -3,7 +3,6 @@ package pkg
 import (
 	"context"
 	"fmt"
-	"github.com/golang/protobuf/ptypes"
 	"github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/openkruise/kruise-game/apis/v1alpha1"
 	"github.com/openkruise/kruise-game/pkg/client/clientset/versioned"
@@ -26,8 +25,14 @@ const (
 	BackfillConnectionKey     = "game.kruise.io/connection"
 	BackfillConnectedTag      = "game.kruise.io/connected"
 	OpenMatchLabelSelectorKey = "game.kruise.io/owner-gss"
+	AssignmentGsNameKey       = "game.kruise.io/gs-name"
 	GameNameProfileKey        = "game_name"
 )
+
+type ConnectInfo struct {
+	address string
+	gsName  string
+}
 
 type Allocator struct {
 	gameServerInformerFactory externalversions.SharedInformerFactory
@@ -195,12 +200,12 @@ func (a *Allocator) fetch(p *pb.MatchProfile) ([]*pb.Match, error) {
 
 // assignMatch assigns `match`. If we fail, abandon the tickets - we'll catch it next loop.
 func (a *Allocator) assignMatch(match *pb.Match) error {
-	backfill, conn, err := a.getBackfillConn(match)
+	backfill, connectInfo, err := a.getBackfillConn(match)
 	if err != nil {
 		return err
 	}
 	log.Infof("The backfill in the match %v is %v", match, backfill)
-	if conn == "" {
+	if connectInfo == nil {
 		chosenGameServer, err := a.choseGameServer(match)
 		if err != nil {
 			return err
@@ -208,7 +213,10 @@ func (a *Allocator) assignMatch(match *pb.Match) error {
 
 		// get external addresses
 		externalAddress := chosenGameServer.Status.NetworkStatus.ExternalAddresses[0]
-		conn = fmt.Sprintf("%s:%s", externalAddress.IP, externalAddress.Ports[0].Port)
+		addr := fmt.Sprintf("%s:%s", externalAddress.IP, externalAddress.Ports[0].Port)
+
+		// get gsName
+		gsName := chosenGameServer.GetNamespace() + "/" + chosenGameServer.GetName()
 
 		patchData := []byte(`
 		{
@@ -227,38 +235,57 @@ func (a *Allocator) assignMatch(match *pb.Match) error {
 		log.Infof("GameServer %s has been allocated.", chosenGameServer.Name)
 
 		if backfill != nil {
-			err = a.updateBackfill(backfill, conn)
+			err = a.updateBackfill(backfill, &ConnectInfo{
+				address: addr,
+				gsName:  gsName,
+			})
 			if err != nil {
 				return err
 			}
 		}
 	}
 
-	if err := a.assignConnToTickets(conn, match); err != nil {
-		log.Errorf("Could not assign connection %s to match %s: %v", conn, match.GetMatchId(), err)
+	if err := a.assignConnToTickets(connectInfo, match); err != nil {
+		log.Errorf("Could not assign connection %v to match %s: %v", connectInfo, match.GetMatchId(), err)
 		return err
 	}
 
-	log.Infof("Assigned %s to match %s", conn, match.GetMatchId())
+	log.Infof("Assigned %v to match %s", connectInfo, match.GetMatchId())
 	return nil
 }
 
-func (a *Allocator) getBackfillConn(match *pb.Match) (*pb.Backfill, string, error) {
+func (a *Allocator) getBackfillConn(match *pb.Match) (*pb.Backfill, *ConnectInfo, error) {
 	backfill := match.Backfill
 	if backfill != nil {
 		if backfill.Extensions != nil {
-			if any, ok := backfill.Extensions[BackfillConnectionKey]; ok {
+			var addr string
+			var gsName string
+			if anyConn, ok := backfill.Extensions[BackfillConnectionKey]; ok {
 				var val wrappers.StringValue
-				err := ptypes.UnmarshalAny(any, &val)
+				err := anyConn.UnmarshalTo(&val)
 				if err != nil {
-					return nil, "", err
+					log.Errorf("Unmarshal Backfill %s Extensions-BackfillConnectionKey failed", backfill.Id)
+					return nil, nil, err
 				}
-				return backfill, val.Value, nil
+				addr = val.Value
 			}
+			if anyGsName, ok := backfill.Extensions[AssignmentGsNameKey]; ok {
+				var val wrappers.StringValue
+				err := anyGsName.UnmarshalTo(&val)
+				if err != nil {
+					log.Errorf("Unmarshal Backfill %s Extensions-AssignmentGsNameKey failed", backfill.Id)
+					return nil, nil, err
+				}
+				gsName = val.Value
+			}
+			return backfill, &ConnectInfo{
+				address: addr,
+				gsName:  gsName,
+			}, nil
 		}
-		return backfill, "", nil
+		return backfill, nil, nil
 	}
-	return nil, "", nil
+	return nil, nil, nil
 }
 
 func (a *Allocator) choseGameServer(match *pb.Match) (*v1alpha1.GameServer, error) {
@@ -305,18 +332,24 @@ func (a *Allocator) choseGameServer(match *pb.Match) (*v1alpha1.GameServer, erro
 	return chosenGameServer, nil
 }
 
-func (a *Allocator) updateBackfill(backfill *pb.Backfill, conn string) error {
+func (a *Allocator) updateBackfill(backfill *pb.Backfill, conn *ConnectInfo) error {
 	// update backfill connection info
 	if backfill.Extensions == nil {
 		backfill.Extensions = make(map[string]*anypb.Any)
 	}
 
-	any, err := ptypes.MarshalAny(&wrappers.StringValue{Value: conn})
+	anyAddr, err := anypb.New(&wrappers.StringValue{Value: conn.address})
 	if err != nil {
 		return err
 	}
+	backfill.Extensions[BackfillConnectionKey] = anyAddr
 
-	backfill.Extensions[BackfillConnectionKey] = any
+	anyGsName, err := anypb.New(&wrappers.StringValue{Value: conn.gsName})
+	if err != nil {
+		return err
+	}
+	backfill.Extensions[AssignmentGsNameKey] = anyGsName
+
 	backfill.SearchFields.Tags = append(backfill.SearchFields.Tags, BackfillConnectedTag)
 
 	req := &pb.UpdateBackfillRequest{
@@ -329,28 +362,35 @@ func (a *Allocator) updateBackfill(backfill *pb.Backfill, conn string) error {
 	return nil
 }
 
-func (a *Allocator) assignConnToTickets(conn string, match *pb.Match) error {
+func (a *Allocator) assignConnToTickets(conn *ConnectInfo, match *pb.Match) error {
 	ticketIDs := []string{}
 	for _, t := range match.GetTickets() {
 		ticketIDs = append(ticketIDs, t.Id)
 	}
+
+	assignmentExtensions := match.Extensions
+	if assignmentExtensions == nil {
+		assignmentExtensions = make(map[string]*anypb.Any)
+	}
+	anyGsName, err := anypb.New(&wrappers.StringValue{Value: conn.gsName})
+	if err != nil {
+		return err
+	}
+	assignmentExtensions[AssignmentGsNameKey] = anyGsName
 
 	req := &pb.AssignTicketsRequest{
 		Assignments: []*pb.AssignmentGroup{
 			{
 				TicketIds: ticketIDs,
 				Assignment: &pb.Assignment{
-					Connection: conn,
-					Extensions: match.Extensions,
-					//Extensions: map[string]*anypb.Any{
-					//	"GameServer": gameServer,
-					//},
+					Connection: conn.address,
+					Extensions: assignmentExtensions,
 				},
 			},
 		},
 	}
 
-	_, err := a.BackendClient.AssignTickets(context.Background(), req)
+	_, err = a.BackendClient.AssignTickets(context.Background(), req)
 	return err
 }
 
