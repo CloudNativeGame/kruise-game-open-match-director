@@ -26,6 +26,7 @@ const (
 	BackfillConnectionKey     = "game.kruise.io/connection"
 	BackfillConnectedTag      = "game.kruise.io/connected"
 	OpenMatchLabelSelectorKey = "game.kruise.io/owner-gss"
+	GameServerMatchIdKey      = "gs-sync/match-id"
 	GameNameProfileKey        = "game_name"
 )
 
@@ -210,12 +211,18 @@ func (a *Allocator) assignMatch(match *pb.Match) error {
 		externalAddress := chosenGameServer.Status.NetworkStatus.ExternalAddresses[0]
 		conn = fmt.Sprintf("%s:%s", externalAddress.IP, externalAddress.Ports[0].Port)
 
-		patchData := []byte(`
+		patchData := []byte(fmt.Sprintf(`
 		{
+            "metadata": {
+				"annotations": 
+				{
+					%s: %s
+				}
+            },
 			"spec": {
 				"opsState": "Allocated"
 			}
-		}`)
+		}`, GameServerMatchIdKey, match.GetMatchId()))
 
 		_, err = a.GameServerClient.GameV1alpha1().GameServers(chosenGameServer.Namespace).Patch(context.Background(), chosenGameServer.Name, types.MergePatchType, patchData, metav1.PatchOptions{})
 
