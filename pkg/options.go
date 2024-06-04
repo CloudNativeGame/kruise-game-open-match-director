@@ -18,6 +18,8 @@ type Options struct {
 	GameServersReSyncInterval time.Duration
 	MatchPullingInterval      time.Duration
 	ProfileName               string
+	SlaveClustersNames        string
+	Namespace                 string
 	GameServerSetNames        string
 }
 

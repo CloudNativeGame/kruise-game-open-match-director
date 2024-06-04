@@ -61,6 +61,7 @@ func main() {
 	flag.DurationVar(&opt.MatchPullingInterval, "match-pulling-interval", time.Second*5, "match pulling interval,default: 5s")
 	flag.StringVar(&opt.GameServerSetNames, "gss-names", "", "the names of GameServerSets perceived by director")
 	flag.StringVar(&opt.ProfileName, "profile-name", "default", "")
+	flag.StringVar(&opt.SlaveClustersNames, "slave-clusters", "", "Specify the slave cluster names, which are also the names of corresponding kubeconfig secrets. Format is {cluster_1_secret_name},{cluster_2_secret_name},...")
 	flag.Parse()
 
 	if leaseLockName == "" {
@@ -70,6 +71,8 @@ func main() {
 	if leaseLockNamespace == "" {
 		klog.Fatal("unable to get lease lock resource namespace (missing lease-lock-namespace flag).")
 	}
+
+	opt.Namespace = leaseLockNamespace
 
 	// leader election uses the Kubernetes API by writing to a
 	// lock object, which can be a LeaseLock object (preferred),

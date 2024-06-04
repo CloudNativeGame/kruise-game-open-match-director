@@ -5,6 +5,13 @@ metadata:
   name: kruise-game-open-match-director-role
 rules:
   - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - list
+      - get
+  - apiGroups:
       - game.kruise.io
     resources:
       - gameservers
@@ -94,13 +101,13 @@ spec:
         app: kruise-game-open-match-director
     spec:
       containers:
-      - name: kruise-game-open-match-director
-        image: registry.cn-beijing.aliyuncs.com/chrisliu95/kruise-game-open-match-director:v1.0
-        imagePullPolicy: Always
-        command:
-        - '/director'
-        - '--lease-lock-name=kruise-game-open-match-director'
-        - '--lease-lock-namespace=open-match'
-        - '--match-function-endpoint=open-match-function.open-match.svc.cluster.local'
-        - '--match-function-port=50502'
+        - name: kruise-game-open-match-director
+          image: registry.cn-beijing.aliyuncs.com/chrisliu95/kruise-game-open-match-director:v2.0
+          imagePullPolicy: Always
+          command:
+            - '/director'
+            - '--lease-lock-name=kruise-game-open-match-director'
+            - '--lease-lock-namespace=open-match'
+            - '--match-function-endpoint=open-match-function.open-match.svc.cluster.local'
+            - '--match-function-port=50502'
       serviceAccountName: kruise-game-open-match-director-sa
