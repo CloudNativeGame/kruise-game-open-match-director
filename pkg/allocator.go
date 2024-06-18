@@ -14,6 +14,8 @@ import (
 	"io"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
 	log "k8s.io/klog/v2"
 	"open-match.dev/open-match/pkg/pb"
 	"strings"
@@ -25,9 +27,10 @@ const (
 	BackfillConnectionKey     = "game.kruise.io/connection"
 	BackfillConnectedTag      = "game.kruise.io/connected"
 	OpenMatchLabelSelectorKey = "game.kruise.io/owner-gss"
-  AssignmentGsNameKey       = "game.kruise.io/gs-name"
+	AssignmentGsNameKey       = "game.kruise.io/gs-name"
 	GameServerMatchIdKey      = "gs-sync/match-id"
 	GameNameProfileKey        = "game_name"
+	ClusterHostName           = "Host"
 )
 
 type ConnectInfo struct {
@@ -36,9 +39,9 @@ type ConnectInfo struct {
 }
 
 type Allocator struct {
-	gameServerInformerFactory externalversions.SharedInformerFactory
-	GameServerLister          v1alpha1Lister.GameServerLister
-	GameServerClient          v1alpha1client.Interface
+	gameServerInformerFactories []externalversions.SharedInformerFactory
+	GameServerListers           map[string]v1alpha1Lister.GameServerLister
+	GameServerClients           map[string]v1alpha1client.Interface
 
 	BackendClient  pb.BackendServiceClient
 	BackendConn    *grpc.ClientConn
@@ -51,6 +54,7 @@ type Allocator struct {
 	GameServerLabelSelector string
 	ProfileName             string
 	GameServerSetNames      string
+	ClusterNames            []string
 
 	//GameServersReSyncInterval time.Duration
 	MatchPullingInterval time.Duration
@@ -87,32 +91,67 @@ func NewAllocator(options *Options) (allocator *Allocator, err error) {
 	fe := pb.NewFrontendServiceClient(frontendConn)
 
 	config := options.Config
-	kruiseGameClient, err := versioned.NewForConfig(config)
-
+	hostKruiseGameClient, err := versioned.NewForConfig(config)
 	if err != nil {
 		log.Errorf("Failed to create kruise game client,because of %v", err)
 		return
 	}
 
-	gameServerInformerFactory := externalversions.NewSharedInformerFactory(kruiseGameClient, options.GameServersReSyncInterval)
+	// Host Cluster
+	gameServerClients := make(map[string]v1alpha1client.Interface)
+	gameServersListers := make(map[string]v1alpha1Lister.GameServerLister)
+	gameServerClients[ClusterHostName] = hostKruiseGameClient
+	clusterNames := []string{ClusterHostName}
+	hostInformerFactory := externalversions.NewSharedInformerFactory(hostKruiseGameClient, options.GameServersReSyncInterval)
+	gameServerInformerFactories := []externalversions.SharedInformerFactory{hostInformerFactory}
+	gameServersListers[ClusterHostName] = hostInformerFactory.Game().V1alpha1().GameServers().Lister()
 
-	// Create GameServer informer by informerFactory
-	gameServers := gameServerInformerFactory.Game().V1alpha1().GameServers()
+	// Other Clusters
+	if options.SlaveClustersNames != "" {
+		kubeClient, err := kubernetes.NewForConfig(config)
+		if err != nil {
+			log.Errorf("Failed to create kube client,because of %v", err)
+			return nil, err
+		}
+		for _, clusterName := range strings.Split(options.SlaveClustersNames, ",") {
+			log.Infof("Cluster name is %s\n", clusterName)
+			secret, err := kubeClient.CoreV1().Secrets(options.Namespace).Get(context.TODO(), clusterName, metav1.GetOptions{})
+			if err != nil {
+				return nil, err
+			}
+
+			config, err := clientcmd.RESTConfigFromKubeConfig(secret.Data["config"])
+			kruiseGameClient, err := versioned.NewForConfig(config)
+			if err != nil {
+				log.Errorf("Failed to create kruise game client,because of %v", err)
+				return nil, err
+			}
+
+			gameServerInformerFactory := externalversions.NewSharedInformerFactory(kruiseGameClient, options.GameServersReSyncInterval)
+			gameServersLister := gameServerInformerFactory.Game().V1alpha1().GameServers().Lister()
+
+			gameServerClients[clusterName] = kruiseGameClient
+			gameServersListers[clusterName] = gameServersLister
+			clusterNames = append(clusterNames, clusterName)
+			gameServerInformerFactories = append(gameServerInformerFactories, gameServerInformerFactory)
+		}
+	}
 
 	return &Allocator{
-		BackendConn:               backendConn,
-		FrontendConn:              frontendConn,
-		gameServerInformerFactory: gameServerInformerFactory,
-		BackendClient:             be,
-		FrontendClient:            fe,
-		MatchFunctionEndpoint:     options.MatchFunctionEndpoint,
-		MatchFunctionPort:         int32(options.MatchFunctionPort),
-		GameServerLister:          gameServers.Lister(),
-		GameServerClient:          kruiseGameClient,
-		GameServerLabelSelector:   options.GameServerLabelSelector,
-		ProfileName:               options.ProfileName,
-		GameServerSetNames:        options.GameServerSetNames,
-		MatchPullingInterval:      options.MatchPullingInterval,
+		BackendConn:                 backendConn,
+		FrontendConn:                frontendConn,
+		gameServerInformerFactories: gameServerInformerFactories,
+		BackendClient:               be,
+		FrontendClient:              fe,
+		MatchFunctionEndpoint:       options.MatchFunctionEndpoint,
+		MatchFunctionPort:           int32(options.MatchFunctionPort),
+		GameServerListers:           gameServersListers,
+		GameServerClients:           gameServerClients,
+		GameServerLabelSelector:     options.GameServerLabelSelector,
+		ProfileName:                 options.ProfileName,
+		GameServerSetNames:          options.GameServerSetNames,
+		ClusterNames:                clusterNames,
+		MatchPullingInterval:        options.MatchPullingInterval,
 	}, nil
 }
 
@@ -126,13 +165,14 @@ func (a *Allocator) Run() {
 	stopCh := make(chan struct{})
 	defer close(stopCh)
 
-	go a.gameServerInformerFactory.Start(stopCh)
+	for _, gameServerInformerFactory := range a.gameServerInformerFactories {
+		go gameServerInformerFactory.Start(stopCh)
 
-	informerHasSynced := a.gameServerInformerFactory.WaitForCacheSync(stopCh)
-
-	for informer, synced := range informerHasSynced {
-		if synced == false {
-			log.Fatalf("Failed to sync informer %v", informer)
+		informerHasSynced := gameServerInformerFactory.WaitForCacheSync(stopCh)
+		for informer, synced := range informerHasSynced {
+			if synced == false {
+				log.Fatalf("Failed to sync informer %v", informer)
+			}
 		}
 	}
 
@@ -224,7 +264,7 @@ func (a *Allocator) assignMatch(match *pb.Match) error {
             "metadata": {
 				"annotations": 
 				{
-					%s: %s
+					"%s": "%s"
 				}
             },
 			"spec": {
@@ -232,7 +272,8 @@ func (a *Allocator) assignMatch(match *pb.Match) error {
 			}
 		}`, GameServerMatchIdKey, match.GetMatchId()))
 
-		_, err = a.GameServerClient.GameV1alpha1().GameServers(chosenGameServer.Namespace).Patch(context.Background(), chosenGameServer.Name, types.MergePatchType, patchData, metav1.PatchOptions{})
+		clusterName := parseClusterNameByProfileName(match.MatchProfile)
+		_, err = a.GameServerClients[clusterName].GameV1alpha1().GameServers(chosenGameServer.Namespace).Patch(context.Background(), chosenGameServer.Name, types.MergePatchType, patchData, metav1.PatchOptions{})
 
 		if err != nil {
 			log.Errorf("Failed to make match because of %s", err.Error())
@@ -241,11 +282,13 @@ func (a *Allocator) assignMatch(match *pb.Match) error {
 
 		log.Infof("GameServer %s has been allocated.", chosenGameServer.Name)
 
+		connectInfo = &ConnectInfo{
+			address: addr,
+			gsName:  gsName,
+		}
+
 		if backfill != nil {
-			err = a.updateBackfill(backfill, &ConnectInfo{
-				address: addr,
-				gsName:  gsName,
-			})
+			err = a.updateBackfill(backfill, connectInfo)
 			if err != nil {
 				return err
 			}
@@ -296,10 +339,7 @@ func (a *Allocator) getBackfillConn(match *pb.Match) (*pb.Backfill, *ConnectInfo
 }
 
 func (a *Allocator) choseGameServer(match *pb.Match) (*v1alpha1.GameServer, error) {
-	gssName := match.MatchProfile
-	if match.MatchProfile == a.ProfileName {
-		gssName = a.GameServerSetNames
-	}
+	gssName := parseGssNameByProfileName(match.MatchProfile)
 	labelSelector := metav1.LabelSelector{
 		MatchLabels: map[string]string{
 			OpenMatchLabelSelectorKey: gssName,
@@ -312,7 +352,8 @@ func (a *Allocator) choseGameServer(match *pb.Match) (*v1alpha1.GameServer, erro
 		return nil, err
 	}
 
-	gameServers, err := a.GameServerLister.List(selector)
+	clusterName := parseClusterNameByProfileName(match.MatchProfile)
+	gameServers, err := a.GameServerListers[clusterName].List(selector)
 	if err != nil {
 		log.Errorf("Failed to list game servers,because of %s", err.Error())
 		return nil, err
@@ -404,24 +445,34 @@ func (a *Allocator) assignConnToTickets(conn *ConnectInfo, match *pb.Match) erro
 func (a *Allocator) generateProfiles() []*pb.MatchProfile {
 	var profiles []*pb.MatchProfile
 	for _, gssName := range strings.Split(a.GameServerSetNames, ",") {
-		profiles = append(profiles, &pb.MatchProfile{
-			Name: gssName,
-			Pools: []*pb.Pool{{
-				Name: GameNameProfileKey,
-				StringEqualsFilters: []*pb.StringEqualsFilter{
-					{
-						StringArg: GameNameProfileKey,
-						Value:     gssName,
+		for _, clusterName := range a.ClusterNames {
+			profileName := gssName + "_" + clusterName
+			if len(a.ClusterNames) == 1 && clusterName == ClusterHostName {
+				profileName = gssName
+			}
+			profiles = append(profiles, &pb.MatchProfile{
+				Name: profileName,
+				Pools: []*pb.Pool{{
+					Name: GameNameProfileKey,
+					StringEqualsFilters: []*pb.StringEqualsFilter{
+						{
+							StringArg: GameNameProfileKey,
+							Value:     gssName,
+						},
 					},
-				},
-			}},
-		})
+				}},
+			})
+		}
 	}
-	profiles = append(profiles, &pb.MatchProfile{
-		Name: a.ProfileName,
-		Pools: []*pb.Pool{{
-			Name: a.ProfileName,
-		}},
-	})
 	return profiles
+}
+
+func parseClusterNameByProfileName(profileName string) string {
+	strs := strings.Split(profileName, "_")
+	return strs[1]
+}
+
+func parseGssNameByProfileName(profileName string) string {
+	strs := strings.Split(profileName, "_")
+	return strs[0]
 }
