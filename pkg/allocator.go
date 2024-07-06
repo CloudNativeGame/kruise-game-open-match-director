@@ -298,6 +298,7 @@ func (a *Allocator) assignMatch(match *pb.Match) error {
 		if backfill != nil {
 			err = a.updateBackfill(backfill, connectInfo)
 			if err != nil {
+				a.rollbackChosenGameServer(clusterName, chosenGameServer)
 				return err
 			}
 		}
@@ -486,4 +487,21 @@ func parseClusterNameByProfileName(profileName string) string {
 func parseGssNameByProfileName(profileName string) string {
 	strs := strings.Split(profileName, "_")
 	return strs[0]
+}
+
+func (a *Allocator) rollbackChosenGameServer(clusterName string, chosenGameServer *v1alpha1.GameServer) {
+	log.Warning("rollback " + chosenGameServer.Name + " from Allocated to None because UpdateBackfill failed")
+	patchData := []byte(fmt.Sprintf(`
+		[{
+			"op": "remove",
+			"path": "/metadata/annotations/%s"
+		},{
+			"op": "replace",
+			"path": "/spec/opsState",
+			"value": "None"
+		}]`, strings.ReplaceAll(GameServerMatchIdKey, "/", "~1")))
+	_, err := a.GameServerClients[clusterName].GameV1alpha1().GameServers(chosenGameServer.Namespace).Patch(context.Background(), chosenGameServer.Name, types.JSONPatchType, patchData, metav1.PatchOptions{})
+	if err != nil {
+		log.Errorf("Failed to rollback GameServer because of %s", err.Error())
+	}
 }
