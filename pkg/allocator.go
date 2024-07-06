@@ -469,7 +469,10 @@ func (a *Allocator) generateProfiles() []*pb.MatchProfile {
 
 func parseClusterNameByProfileName(profileName string) string {
 	strs := strings.Split(profileName, "_")
-	return strs[1]
+	if len(strs) > 1 {
+		return strs[1]
+	}
+	return ClusterHostName
 }
 
 func parseGssNameByProfileName(profileName string) string {
