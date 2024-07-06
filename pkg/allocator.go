@@ -10,6 +10,8 @@ import (
 	"github.com/openkruise/kruise-game/pkg/client/informers/externalversions"
 	v1alpha1Lister "github.com/openkruise/kruise-game/pkg/client/listers/apis/v1alpha1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/balancer/roundrobin"
+	"google.golang.org/grpc/resolver"
 	"google.golang.org/protobuf/types/known/anypb"
 	"io"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,6 +34,10 @@ const (
 	GameNameProfileKey        = "game_name"
 	ClusterHostName           = "Host"
 )
+
+func init() {
+	resolver.SetDefaultScheme("dns")
+}
 
 type ConnectInfo struct {
 	address string
@@ -68,7 +74,8 @@ func NewAllocator(options *Options) (allocator *Allocator, err error) {
 		return
 	}
 
-	backendConn, err := grpc.Dial(backendConnStr, grpc.WithInsecure())
+	backendConn, err := grpc.Dial(backendConnStr, grpc.WithInsecure(),
+		grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingPolicy":"%s"}`, roundrobin.Name)))
 	if err != nil {
 		log.Errorf("Failed to connect to Open Match Backend, got %v", err)
 		return
@@ -82,7 +89,8 @@ func NewAllocator(options *Options) (allocator *Allocator, err error) {
 		return
 	}
 
-	frontendConn, err := grpc.Dial(frontendConnStr, grpc.WithInsecure())
+	frontendConn, err := grpc.Dial(frontendConnStr, grpc.WithInsecure(),
+		grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingPolicy":"%s"}`, roundrobin.Name)))
 	if err != nil {
 		log.Errorf("Failed to connect to Open Match Frontend, got %v", err)
 		return
@@ -155,7 +163,7 @@ func NewAllocator(options *Options) (allocator *Allocator, err error) {
 	}, nil
 }
 
-func (a *Allocator) Run() {
+func (a *Allocator) Run(loopStopCh <-chan struct{}, loopDoneCh chan<- struct{}) {
 	log.Info("Ready to run allocator service")
 	// Generate the profiles to fetch matches for.
 	defer a.BackendConn.Close()
@@ -204,7 +212,16 @@ func (a *Allocator) Run() {
 		}
 
 		wg.Wait()
+
+		select {
+		case <-loopStopCh:
+			goto end
+		default:
+		}
 	}
+end:
+	log.Info("loop done")
+	loopDoneCh <- struct{}{}
 }
 
 func (a *Allocator) fetch(p *pb.MatchProfile) ([]*pb.Match, error) {
@@ -246,7 +263,7 @@ func (a *Allocator) assignMatch(match *pb.Match) error {
 		return err
 	}
 	log.Infof("The backfill in the match %v is %v", match, backfill)
-	if connectInfo == nil {
+	if connectInfo == nil || len(connectInfo.address) == 0 {
 		chosenGameServer, err := a.choseGameServer(match)
 		if err != nil {
 			return err
@@ -290,6 +307,7 @@ func (a *Allocator) assignMatch(match *pb.Match) error {
 		if backfill != nil {
 			err = a.updateBackfill(backfill, connectInfo)
 			if err != nil {
+				a.rollbackChosenGameServer(clusterName, chosenGameServer)
 				return err
 			}
 		}
@@ -469,10 +487,30 @@ func (a *Allocator) generateProfiles() []*pb.MatchProfile {
 
 func parseClusterNameByProfileName(profileName string) string {
 	strs := strings.Split(profileName, "_")
-	return strs[1]
+	if len(strs) > 1 {
+		return strs[1]
+	}
+	return ClusterHostName
 }
 
 func parseGssNameByProfileName(profileName string) string {
 	strs := strings.Split(profileName, "_")
 	return strs[0]
+}
+
+func (a *Allocator) rollbackChosenGameServer(clusterName string, chosenGameServer *v1alpha1.GameServer) {
+	log.Warning("rollback " + chosenGameServer.Name + " from Allocated to None because UpdateBackfill failed")
+	patchData := []byte(fmt.Sprintf(`
+		[{
+			"op": "remove",
+			"path": "/metadata/annotations/%s"
+		},{
+			"op": "replace",
+			"path": "/spec/opsState",
+			"value": "None"
+		}]`, strings.ReplaceAll(GameServerMatchIdKey, "/", "~1")))
+	_, err := a.GameServerClients[clusterName].GameV1alpha1().GameServers(chosenGameServer.Namespace).Patch(context.Background(), chosenGameServer.Name, types.JSONPatchType, patchData, metav1.PatchOptions{})
+	if err != nil {
+		log.Errorf("Failed to rollback GameServer because of %s", err.Error())
+	}
 }
