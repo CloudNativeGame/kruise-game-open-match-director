@@ -163,7 +163,7 @@ func NewAllocator(options *Options) (allocator *Allocator, err error) {
 	}, nil
 }
 
-func (a *Allocator) Run() {
+func (a *Allocator) Run(loopStopCh <-chan struct{}, loopDoneCh chan<- struct{}) {
 	log.Info("Ready to run allocator service")
 	// Generate the profiles to fetch matches for.
 	defer a.BackendConn.Close()
@@ -212,7 +212,16 @@ func (a *Allocator) Run() {
 		}
 
 		wg.Wait()
+
+		select {
+		case <-loopStopCh:
+			goto end
+		default:
+		}
 	}
+end:
+	log.Info("loop done")
+	loopDoneCh <- struct{}{}
 }
 
 func (a *Allocator) fetch(p *pb.MatchProfile) ([]*pb.Match, error) {

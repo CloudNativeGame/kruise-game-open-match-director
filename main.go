@@ -84,6 +84,9 @@ func main() {
 		klog.Fatalf("Failed to build kubeConfig,because of %v", err)
 	}
 
+	loopStopCh := make(chan struct{})
+	loopDoneCh := make(chan struct{})
+
 	// run loop
 	run := func(ctx context.Context) {
 		// complete your controller loop here
@@ -97,13 +100,17 @@ func main() {
 		}
 
 		// Run main loop
-		allocator.Run()
+		allocator.Run(loopStopCh, loopDoneCh)
 	}
 
 	// use a Go context so we can tell the leaderelection code when we
 	// want to step down
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	defer func() {
+		close(loopStopCh)
+		<-loopDoneCh
+		cancel()
+	}()
 
 	// listen for interrupts or the Linux SIGTERM signal and cancel
 	// our context, which the leader election code will observe and
@@ -113,6 +120,8 @@ func main() {
 	go func() {
 		<-ch
 		klog.Info("Received termination, signaling shutdown")
+		close(loopStopCh)
+		<-loopDoneCh
 		cancel()
 	}()
 
