@@ -246,7 +246,7 @@ func (a *Allocator) assignMatch(match *pb.Match) error {
 		return err
 	}
 	log.Infof("The backfill in the match %v is %v", match, backfill)
-	if connectInfo == nil {
+	if connectInfo == nil || len(connectInfo.address) == 0 {
 		chosenGameServer, err := a.choseGameServer(match)
 		if err != nil {
 			return err
