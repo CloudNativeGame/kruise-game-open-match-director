@@ -10,6 +10,8 @@ import (
 	"github.com/openkruise/kruise-game/pkg/client/informers/externalversions"
 	v1alpha1Lister "github.com/openkruise/kruise-game/pkg/client/listers/apis/v1alpha1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/balancer/roundrobin"
+	"google.golang.org/grpc/resolver"
 	"google.golang.org/protobuf/types/known/anypb"
 	"io"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,6 +34,10 @@ const (
 	GameNameProfileKey        = "game_name"
 	ClusterHostName           = "Host"
 )
+
+func init() {
+	resolver.SetDefaultScheme("dns")
+}
 
 type ConnectInfo struct {
 	address string
@@ -68,7 +74,8 @@ func NewAllocator(options *Options) (allocator *Allocator, err error) {
 		return
 	}
 
-	backendConn, err := grpc.Dial(backendConnStr, grpc.WithInsecure())
+	backendConn, err := grpc.Dial(backendConnStr, grpc.WithInsecure(),
+		grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingPolicy":"%s"}`, roundrobin.Name)))
 	if err != nil {
 		log.Errorf("Failed to connect to Open Match Backend, got %v", err)
 		return
@@ -82,7 +89,8 @@ func NewAllocator(options *Options) (allocator *Allocator, err error) {
 		return
 	}
 
-	frontendConn, err := grpc.Dial(frontendConnStr, grpc.WithInsecure())
+	frontendConn, err := grpc.Dial(frontendConnStr, grpc.WithInsecure(),
+		grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingPolicy":"%s"}`, roundrobin.Name)))
 	if err != nil {
 		log.Errorf("Failed to connect to Open Match Frontend, got %v", err)
 		return
